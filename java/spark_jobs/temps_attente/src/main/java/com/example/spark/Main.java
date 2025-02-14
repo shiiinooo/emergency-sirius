@@ -23,65 +23,96 @@ public class Main {
             .option("inferSchema", "true")
             .csv("/user/hadoop/silver/temps_attente/Urgence_data.csv");
 
-        // Remove columns - using trim to handle potential whitespace in column names
-        String[] columnsToDrop = {
-            "moyen_arrivee", "motif_entree", "Antécédents_médicaux", "Antécédents_chirurgicaux",
-            "PAS/PAD", "frequence_cardiaque", "Temperature", "SaO2", "frequence_respiratoire",
-            "result_anamnese", "IAO_observation", "exam_biologie", "exam_radiologie",
-            "exam_echographie", "scanner", "IRM", "DH_first_biology_prescription",
-            "DH_first_biology_prelev", "type_orientation", "destination_orientation",
-            "transfert_service", "transfert_hopital","result_anamnese","frequence_respiratoire","avis_specialist","code_diagnostic","dossier_hopital"        };
-
-        // First, trim all column names to handle whitespace
+        // Trim all column names
         for (String colName : data.columns()) {
             if (colName.trim().length() != colName.length()) {
                 data = data.withColumnRenamed(colName, colName.trim());
             }
         }
 
-        Dataset<Row> transformedData = data.drop(columnsToDrop);
+        // Generate unique IDs for each table
+        Dataset<Row> withIds = data
+            .withColumn("passage_id", monotonically_increasing_id())
+            .withColumn("patient_id", hash(col("dossier_hopital")))
+            .withColumn("calendar_id", hash(to_date(to_timestamp(col("DH_arrivee"), "dd/MM/yyyy HH:mm"))));
 
-        // Handle date and time transformations
-        transformedData = transformedData
+        // Create Patient table
+        Dataset<Row> patientTable = withIds.select(
+            col("patient_id"),
+            col("dossier_hopital"),
+            col("Antécédents_médicaux").as("antecedents_medicaux"),
+            col("Antécédents_chirurgicaux").as("antecedents_chirurgicaux")
+        ).distinct();
+
+        // Create Calendar table
+        Dataset<Row> calendarTable = withIds
+            .withColumn("date_complete", to_timestamp(col("DH_arrivee"), "dd/MM/yyyy HH:mm"))
+            .select(
+                col("calendar_id"),
+                to_date(col("date_complete")).as("date"),
+                year(col("date_complete")).as("annee"),
+                month(col("date_complete")).as("mois"),
+                dayofmonth(col("date_complete")).as("jour"),
+                date_format(col("date_complete"), "EEEE").as("jour_semaine"),
+                hour(col("date_complete")).as("heure")
+            ).distinct();
+
+        // Create Passage table
+        Dataset<Row> passageTable = withIds
             // Parse DH_arrivee as timestamp first
             .withColumn("DH_arrivee_ts", to_timestamp(col("DH_arrivee"), "dd/MM/yyyy HH:mm"))
-            // Extract date and time components
-            .withColumn("date_arrivee", to_date(col("DH_arrivee_ts")))
-            .withColumn("heure_arrivee", date_format(col("DH_arrivee_ts"), "HH:mm"))
-            // Calculate sortie time (adding random minutes between 30 and 180)
+            // Calculate sortie time
             .withColumn("minutes_to_add", expr("CAST(rand() * (180 - 30) + 30 AS INT)"))
-            // Corrected the timestamp addition syntax (add minutes as seconds)
             .withColumn("DH_sortie_ts", expr("from_unixtime(unix_timestamp(DH_arrivee_ts) + minutes_to_add * 60)"))
-            .withColumn("heure_sortie", date_format(col("DH_sortie_ts"), "HH:mm"))
-            // Calculate waiting time in minutes
-            .withColumn("temps_attente", col("minutes_to_add"))
-            .withColumn("temps_attente_heure",
-                  when(col("temps_attente").geq(60),
-                      concat(
-                         lpad((col("temps_attente").divide(60)).cast("int").cast("string"), 2, "0"),
-                         lit(":"),  // Utilise lit() pour convertir ":" en Column
-                         lpad((col("temps_attente").mod(60)).cast("int").cast("string"), 2, "0")
-                     )
-                 ).otherwise(
-                     concat(lit("00:"), lpad(col("temps_attente").cast("int").cast("string"), 2, "0"))
-                 )
-               )
-
-            // Drop temporary columns
-            .drop("DH_arrivee_ts", "DH_sortie_ts", "minutes_to_add","temps_attente");
+            .select(
+                col("passage_id"),
+                col("patient_id"),
+                col("calendar_id"),
+                date_format(col("DH_arrivee_ts"), "HH:mm").as("heure_arrivee"),
+                date_format(col("DH_sortie_ts"), "HH:mm").as("heure_sortie"),
+                col("minutes_to_add").as("temps_attente"),
+                when(col("minutes_to_add").geq(60),
+                    concat(
+                        lpad((col("minutes_to_add").divide(60)).cast("int").cast("string"), 2, "0"),
+                        lit(":"),
+                        lpad((col("minutes_to_add").mod(60)).cast("int").cast("string"), 2, "0")
+                    )
+                ).otherwise(
+                    concat(lit("00:"), lpad(col("minutes_to_add").cast("int").cast("string"), 2, "0"))
+                ).as("temps_attente_heure"),
+                col("motif_entree"),
+                col("moyen_arrivee"),
+                col("PAS/PAD").as("pas_pad"),
+                col("frequence_cardiaque"),
+                col("Temperature").as("temperature"),
+                col("SaO2").as("sao2"),
+                col("IAO_observation").as("iao_observation")
+            );
 
         // Save to MongoDB
-        transformedData.write()
+        patientTable.write()
             .format("mongodb")
-            .option("collection", "tempsattente")
+            .option("collection", "patients")
+            .mode("overwrite")
+            .save();
+
+        calendarTable.write()
+            .format("mongodb")
+            .option("collection", "calendrier")
+            .mode("overwrite")
+            .save();
+
+        passageTable.write()
+            .format("mongodb")
+            .option("collection", "passages")
             .mode("overwrite")
             .save();
 
         // Print statistics
         System.out.println("Original row count: " + data.count());
-        System.out.println("Transformed row count: " + transformedData.count());
-
- 
+        System.out.println("Patient table row count: " + patientTable.count());
+        System.out.println("Calendar table row count: " + calendarTable.count());
+        System.out.println("Passage table row count: " + passageTable.count());
 
         spark.stop();
     }

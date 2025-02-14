@@ -9,49 +9,41 @@ import static org.apache.spark.sql.functions.*;
 
 public class Main {
     public static void main(String[] args) {
-        // Step 1: Create a Spark configuration and session
+        // Create Spark configuration and session
         SparkConf conf = new SparkConf()
-            .setAppName("911-calls-gold")
+            .setAppName("911-calls-dimensions")
             .setMaster("yarn")
             .set("spark.mongodb.read.connection.uri", "mongodb://192.168.4.56:27017/mydb")
             .set("spark.mongodb.write.connection.uri", "mongodb://192.168.4.56:27017/mydb");
 
         SparkSession spark = SparkSession.builder().config(conf).getOrCreate();
 
-        // Step 2: Load the CSV file
+        // Load and clean the data
         String filePath = "/user/hadoop/silver/911_calls/raw_911_calls.csv";
-        Dataset<Row> data = spark.read()
-                                .option("header", "true")
-                                .option("inferSchema", "true")
-                                .csv(filePath);
+        Dataset<Row> rawData = spark.read()
+                                  .option("header", "true")
+                                  .option("inferSchema", "true")
+                                  .csv(filePath);
 
-        // Print schema to verify column names
-        System.out.println("Original Schema:");
-        data.printSchema();
-
-        // Step 3: Transform the data into a single table with all columns
-        Dataset<Row> transformedData = data
-            // Remove rows with NaN in specified columns
+        // Clean timestamp and create base transformed dataset
+        Dataset<Row> cleanedData = rawData
             .na().drop(new String[]{
-                "Neighborhood",
-                "PoliceDistrict",
-                "PolicePost",
-                "CouncilDistrict",
-                "SheriffDistricts",
-                "Community_Statistical_Areas",
-                "Census_Tracts",
-                "ZIPCode",
-                "priority"
+                "Neighborhood", "PoliceDistrict", "PolicePost", "CouncilDistrict",
+                "SheriffDistricts", "Community_Statistical_Areas", "Census_Tracts",
+                "ZIPCode", "priority"
             })
+            .withColumn("clean_timestamp", 
+                regexp_replace(col("callDateTime"), "\\+00$", ""))
+            .withColumn("call_datetime", 
+                to_timestamp(col("clean_timestamp"), "yyyy/MM/dd HH:mm:ss"));
 
-            // Transform priority levels
-            .withColumn("priority", 
+        // 1. Create 911_calls table (fact table)
+        Dataset<Row> callsTable = cleanedData
+            .withColumn("priority_level", 
                 when(col("priority").equalTo("LOW"), "Emergency")
                 .when(col("priority").equalTo("Non-Emergency"), "Low")
                 .otherwise(col("priority")))
-
-            // Map descriptions to medical emergencies
-            .withColumn("description",
+            .withColumn("call_description",
                 when(col("description").equalTo("DISORDERLY"), "Severe Headache")
                 .when(col("description").equalTo("911/NO  VOICE"), "Unconscious Person")
                 .when(col("description").equalTo("AUTO ACCIDENT"), "Trauma")
@@ -63,76 +55,61 @@ public class Main {
                 .when(col("description").equalTo("HIT AND RUN"), "Trauma")
                 .when(col("description").equalTo("LARCENY"), "Stress Related")
                 .otherwise(col("description")))
-
-            // Clean and transform timestamp
-            .withColumn("clean_timestamp", 
-                regexp_replace(col("callDateTime"), "\\+00$", ""))
-            .withColumn("call_datetime", 
-                to_timestamp(col("clean_timestamp"), "yyyy/MM/dd HH:mm:ss"))
-            
-            // Call infos
-            .withColumn("call_id", col("recordId"))
-            .withColumn("priority_level", col("priority"))
-            .withColumn("call_source", lit("phone"))
-            .withColumn("call_description", col("description"))
-            
-            // Date infos
-            .withColumn("year", year(col("call_datetime")))
-            .withColumn("month", month(col("call_datetime")))
-            .withColumn("day", dayofmonth(col("call_datetime")))
-            .withColumn("hour", hour(col("call_datetime")))
-            .withColumn("minute", minute(col("call_datetime")))
-            .withColumn("weekday", date_format(col("call_datetime"), "EEEE"))
-            .withColumn("week_of_year", weekofyear(col("call_datetime")))
-            .withColumn("quarter", quarter(col("call_datetime")))
-            
-            // Location infos
-            .withColumn("region", lit("Baltimore"))
-            .withColumn("district", col("PoliceDistrict"))
-            .withColumn("neighborhood", col("Neighborhood"))
-            .withColumn("postal_code", col("ZIPCode"))
-            .withColumn("service_area", col("PolicePost"))
-            .withColumn("council_district", col("CouncilDistrict"))
-            .withColumn("community_area", col("Community_Statistical_Areas"))
-            .withColumn("census_tract", col("Census_Tracts"))
-            .withColumn("incident_address", col("incidentLocation"))
-            .withColumn("full_location", col("location"))
-            
-            // Select and rename final columns
             .select(
-                col("call_id"),
+                col("recordId").as("call_id"),
                 col("call_datetime"),
                 col("priority_level"),
-                col("call_source"),
-                col("call_description"),
-                
-                // Date infos
-                col("year"),
-                col("month"),
-                col("day"),
-                col("hour"),
-                col("minute"),
-                col("weekday"),
-                col("week_of_year"),
-                col("quarter"),
-                
-                // Location infos
-                col("region"),
-                col("district"),
-                col("neighborhood"),
-                col("postal_code"),
-                col("service_area"),
-                col("council_district"),
-                col("community_area"),
-                col("census_tract"),
-                col("incident_address"),
-                col("full_location")
+                lit("phone").as("call_source"),
+                col("call_description")
             );
 
-        // Save to MongoDB as a single collection
-        transformedData.write()
+        // 2. Create 911_time table (time dimension)
+        Dataset<Row> timeTable = cleanedData
+            .select(
+                col("recordId").as("call_id"),
+                col("call_datetime"),
+                year(col("call_datetime")).as("year"),
+                month(col("call_datetime")).as("month"),
+                dayofmonth(col("call_datetime")).as("day"),
+                hour(col("call_datetime")).as("hour"),
+                minute(col("call_datetime")).as("minute"),
+                date_format(col("call_datetime"), "EEEE").as("weekday"),
+                weekofyear(col("call_datetime")).as("week_of_year"),
+                quarter(col("call_datetime")).as("quarter")
+            );
+
+        // 3. Create 911_location table (location dimension)
+        Dataset<Row> locationTable = cleanedData
+            .select(
+                col("recordId").as("call_id"),
+                lit("Baltimore").as("region"),
+                col("PoliceDistrict").as("district"),
+                col("Neighborhood").as("neighborhood"),
+                col("ZIPCode").as("postal_code"),
+                col("PolicePost").as("service_area"),
+                col("CouncilDistrict").as("council_district"),
+                col("Community_Statistical_Areas").as("community_area"),
+                col("Census_Tracts").as("census_tract"),
+                col("incidentLocation").as("incident_address"),
+                col("location").as("full_location")
+            );
+
+        // Save tables to MongoDB
+        callsTable.write()
             .format("mongodb")
-            .option("collection", "911-calls-gold")
+            .option("collection", "911_calls")
+            .mode("overwrite")
+            .save();
+
+        timeTable.write()
+            .format("mongodb")
+            .option("collection", "911_time")
+            .mode("overwrite")
+            .save();
+
+        locationTable.write()
+            .format("mongodb")
+            .option("collection", "911_location")
             .mode("overwrite")
             .save();
 
